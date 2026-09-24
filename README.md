@@ -158,4 +158,4 @@ Everything stays inside the permanent GCP free tier: about 676 rows and 4 small 
 ## Author
 
 **Alvaro Yalle**, Senior Data Engineer (GCP · Azure · AWS)
-[GitHub](https://github.com/ayalle2024) · [LinkedIn](https://www.linkedin.com/in/alvaro-luis-yalle-yalli-425b2162) · [Upwork](https://www.upwork.com/freelancers/~01d7539a2f4ec94842) · ayalle@arla-asociados.com
+[GitHub](https://github.com/ayalle2024) · [LinkedIn](https://www.linkedin.com/in/alvaro-luis-yalle-yalli-425b2162) · [Upwork](https://www.upwork.com/freelancers/~01d7539a2f4ec94842) · alvaroyalle@yahoo.es
