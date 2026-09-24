@@ -1,0 +1,141 @@
+# orquestador-weather
+#
+# Disparado por Cloud Scheduler (en vez de llamar directo a la Cloud Run) o
+# manualmente con el botón Execute de la consola.
+# Orquesta la secuencia completa y garantizada del pipeline de Weather ETL:
+#
+#   1) Llama a la Cloud Run (cr-consumo-openmeteo-api) y espera su respuesta
+#      completa. La Cloud Run ya inserta de forma síncrona en GCS y en las
+#      2 tablas de BigQuery antes de responder — confirmado en el código de
+#      services/weather_service.py: insert_raw_weather() e
+#      insert_standard_weather() se llaman ANTES del return, y cualquier
+#      error de inserción se propaga como BigQueryInsertError -> HTTP 502.
+#   2) Verifica explícitamente que la Cloud Run confirmó éxito
+#      (body.status == "success"), no solo que el HTTP fue 200.
+#   3) Recién ahí dispara la Scheduled Query (sq_transform_weather_standard_to_trf)
+#      vía la API de BigQuery Data Transfer.
+#   4) Espera (con polling) a que esa ejecución termine de verdad —
+#      no solo que se haya disparado — antes de dar por terminado el Workflow.
+#
+# Los valores de configuración (project_id, region, nombres, etc.) NO están
+# escritos aquí — se leen de las Environment Variables del propio Workflow
+# (configuradas al desplegar, sección "Environment variables" en la consola,
+# o --env-vars-file con gcloud). La fuente de referencia de esos valores es
+# env.yaml, en esta misma carpeta — ahí se documenta qué poner en cada una.
+
+main:
+  params: []
+  steps:
+    - init:
+        assign:
+          # Leídas de las Environment Variables del Workflow — nada hardcodeado.
+          - project_id: ${sys.get_env("project_id")}
+          - project_number: ${sys.get_env("project_number")}
+          - region: ${sys.get_env("region")}
+          - transfer_location: ${sys.get_env("transfer_location")}
+          - cloud_run_service_name: ${sys.get_env("cloud_run_service_name")}
+          - transfer_config_id: ${sys.get_env("transfer_config_id")}
+          - poll_interval_seconds: ${int(sys.get_env("poll_interval_seconds"))}
+
+          # Construidos a partir de lo de arriba, no escritos a mano de nuevo
+          - cloud_run_url: ${"https://" + cloud_run_service_name + "-" + project_number + "." + region + ".run.app"}
+          - transfer_config_name: ${"projects/" + project_number + "/locations/" + transfer_location + "/transferConfigs/" + transfer_config_id}
+
+    # -----------------------------------------------------------------
+    # Paso 1: ejecutar la Cloud Run y esperar su respuesta completa.
+    # Envuelto en try/except para que, si falla, el mensaje de error real
+    # de la Cloud Run (código HTTP + body) quede visible en la ejecución
+    # del Workflow, en vez de solo el error genérico de Workflows.
+    # -----------------------------------------------------------------
+    - call_cloud_run:
+        try:
+          steps:
+            - do_call_cloud_run:
+                call: http.post
+                args:
+                  url: ${cloud_run_url}
+                  auth:
+                    type: OIDC
+                result: cloud_run_response
+        except:
+          as: cloud_run_error
+          steps:
+            - build_cloud_run_error_message:
+                assign:
+                  - cloud_run_error_message: '${"Fallo llamando a la Cloud Run: " + json.encode_to_string(cloud_run_error)}'
+            - raise_cloud_run_error:
+                raise: ${cloud_run_error_message}
+
+    - log_cloud_run_result:
+        call: sys.log
+        args:
+          text: ${cloud_run_response.body}
+          severity: INFO
+
+    # -----------------------------------------------------------------
+    # Paso 2: verificar explícitamente que la Cloud Run confirmó éxito
+    # (no solo que el HTTP haya sido 200 — que el mensaje diga "success")
+    # -----------------------------------------------------------------
+    - check_cloud_run_status:
+        switch:
+          - condition: ${cloud_run_response.body.status != "success"}
+            raise: '${"Cloud Run no confirmó éxito: " + json.encode_to_string(cloud_run_response.body)}'
+
+    # -----------------------------------------------------------------
+    # Paso 3: disparar la Scheduled Query manualmente, ahora que se
+    # confirmó que los datos ya están insertados correctamente
+    # -----------------------------------------------------------------
+    - trigger_scheduled_query:
+        call: googleapis.bigquerydatatransfer.v1.projects.locations.transferConfigs.startManualRuns
+        args:
+          parent: ${transfer_config_name}
+          body:
+            requestedRunTime: ${time.format(sys.now())}
+        result: transfer_start_response
+
+    - extract_run_name:
+        assign:
+          - transfer_run_name: ${transfer_start_response.runs[0].name}
+
+    # -----------------------------------------------------------------
+    # Paso 4: esperar (polling) a que la Scheduled Query termine de
+    # verdad, no solo que se haya disparado
+    # -----------------------------------------------------------------
+    - check_transfer_run_status:
+        call: googleapis.bigquerydatatransfer.v1.projects.locations.transferConfigs.runs.get
+        args:
+          name: ${transfer_run_name}
+        result: transfer_run_status
+
+    - log_transfer_status:
+        call: sys.log
+        args:
+          text: '${"Estado de la Scheduled Query: " + transfer_run_status.state}'
+          severity: INFO
+
+    - evaluate_transfer_status:
+        switch:
+          - condition: ${transfer_run_status.state == "SUCCEEDED"}
+            next: workflow_success
+          - condition: ${transfer_run_status.state == "FAILED" or transfer_run_status.state == "CANCELLED"}
+            next: build_failure_message
+        next: wait_before_retry
+
+    - wait_before_retry:
+        call: sys.sleep
+        args:
+          seconds: ${poll_interval_seconds}
+        next: check_transfer_run_status
+
+    - build_failure_message:
+        assign:
+          - transfer_error_detail: ${map.get(transfer_run_status, "errorStatus")}
+          - transfer_failure_message: '${"La Scheduled Query terminó en estado " + transfer_run_status.state + ". Detalle: " + json.encode_to_string(transfer_error_detail)}'
+
+    - workflow_failure:
+        raise: ${transfer_failure_message}
+
+    - workflow_success:
+        return:
+          cloud_run_result: ${cloud_run_response.body}
+          scheduled_query_final_state: ${transfer_run_status.state}
